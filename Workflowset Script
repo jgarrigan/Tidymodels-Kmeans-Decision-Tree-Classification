@@ -1,0 +1,259 @@
+# INSTALL PACKAGES
+if (!requireNamespace("pacman", quietly = TRUE)) {
+  message("Installing pacman...")
+  install.packages("pacman")
+}
+
+
+pacman::p_load(tidyverse, 
+               tidymodels, 
+               tidyclust, 
+               janitor, 
+               ClusterR, 
+               moments, 
+               visdat, 
+               skimr, 
+               DescTools, 
+               vip, 
+               rpart.plot, 
+               themis)
+
+# CONVERT DATA INTO CORRECT FORMAT
+mtcars <- mtcars %>%
+  mutate(
+    `am` = factor(`am`, labels = c(`0` = "auto", `1` = "man")),
+    `vs` = factor(`vs`, labels = c(`0` = "V-shaped", `1` = "straight")),
+    `cyl` = factor(`cyl`),
+    `gear` = factor(`gear`),
+    `carb` = factor(`carb`)
+  )
+
+# SET UP 10 FOLD CROSS VALIDATION
+mtcars_cv <- vfold_cv(mtcars, v = 10)
+
+# SET SEED FOR REPRODUCABILITY
+set.seed(123)
+
+
+# EDA ---------------------------------------------------------------------
+
+skimr::skim(mtcars)
+
+DescTools::Desc(mtcars)
+
+
+# MODEL SPEC --------------------------------------------------------------
+
+# CREATE A CLUSTER SPECIFICATION
+kmeans_spec <- k_means(num_clusters = tune())
+
+
+# PREPROCESSING RECIPES ---------------------------------------------------
+
+# RECIPE 1
+rec1 <- recipe(~., data = mtcars) %>%
+  step_log(all_numeric_predictors()) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_zv(all_predictors()) %>%
+  step_normalize(all_numeric_predictors())
+
+# RECIPE 2
+rec2 <- recipe(~., data = mtcars) %>%
+  step_novel(all_nominal()) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_zv(all_predictors()) %>%
+  step_pca(all_predictors(), num_comp = 2) %>%
+  step_normalize(all_numeric_predictors())
+
+# RECIPE 3
+rec3 <- recipe(~., data = mtcars) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_zv(all_predictors()) %>%
+  step_normalize(all_numeric_predictors())
+
+# CREATE A GRID OF PARAMETER VALUES FOR THE NUMBER OF CLUSTERS
+clust_num_grid <- grid_regular(num_clusters(),
+  levels = 10
+)
+
+# WORKFLOW ----------------------------------------------------------------
+
+# CREATE A WORKFLOW WHICH CONTAINS THE MODEL SPECIFICATION AND THE 3 PREPROCESSING RECIPES
+wf_set <- workflow_set(
+  preproc = list(rec1, rec2, rec3),
+  models = list(kmeans_spec)
+)
+
+# TUNE HYPER-PARAMETERS ---------------------------------------------------
+
+# WORKFLOWSETS DON'T CURRENTLY WORK WITH TUNE_CLUSTER SO A CUSTOM FUNCTION IS NEEDED
+tune_cluster_wf <- function(id) {
+  tune_cluster(
+    extract_workflow(wf_set, id),
+    resamples = mtcars_cv,
+    grid = clust_num_grid,
+    metrics = cluster_metric_set(sse_within_total, sse_total, sse_ratio),
+    control = tune::control_grid(save_pred = TRUE, extract = identity)
+  )
+}
+
+# APPLY THE FUNCTION TO THE WORKFLOWSET
+wf_set$result <- map(wf_set$wflow_id, tune_cluster_wf)
+
+# PULL OUT THE SSE_RATION FOR EACH VALUE OF K FOR EACH WORKFLOW ID
+tune_results <- wf_set %>%
+  mutate(metrics = map(result, collect_metrics)) %>%
+  dplyr::select(wflow_id, metrics) %>%
+  tidyr::unnest(cols = metrics) %>%
+  filter(.metric == "sse_ratio") %>%
+  print(n = 50)
+
+# PLOT THE VALUES OF K VS. THE SEE RATIO FOR EACH WORKFLOW ID
+tune_results %>%
+  ggplot(aes(x = num_clusters, y = mean, color = wflow_id)) +
+  geom_point() +
+  geom_line() +
+  theme_minimal() +
+  ggtitle("Plot of WSS/TSS ratio by Number of Clusters") +
+  ylab("Mean WSS/TSS ratio, over 10 folds") +
+  xlab("Number of Clusters") +
+  scale_x_continuous(breaks = 1:10)
+
+# FIT FINAL KMEANS MODEL ---------------------------------------------------------
+
+# RESET THE MODEL WITH OPTIMISED VALUES
+kmeans_tuned <- k_means(num_clusters = 6) %>%
+  parsnip::set_engine("stats", algorithm = "Lloyd")
+
+# RESET THE WORKFLOW
+wf_tuned <- workflow() %>%
+  add_recipe(rec2) %>%
+  add_model(kmeans_tuned)
+
+# FIT THE TUNED WORKFLOW TO THE DATA
+kmeans_fit <- fit(wf_tuned, data = mtcars)
+
+# PREDICT WHICH CLUSTER ASSIGNMENT EACH ROW BELONGS TO
+cluster_assignment <- predict(kmeans_fit, mtcars) %>%
+  as.data.frame()
+
+# BIND THE PREDICTION TO THE ORIGINAL DATA TO CREATE A LABELLED DATASET
+mtcars_clusters <- mtcars %>%
+  bind_cols(cluster_assignment) %>%
+  rename(cluster = .pred_cluster)
+
+
+# DESCISION TREE MODEL ----------------------------------------------------
+
+set.seed(123)
+
+
+# DATA SPLITTING ----------------------------------------------------------
+
+# DEFINE THE RATIO OF TESTING VS. TRAINING
+mtcars_split <- initial_split(mtcars_clusters, prop = 0.75, strata = cluster)
+
+# CREATE A TRAINING DATESET
+mtcars_train <- training(mtcars_split)
+
+# CREATE A TEST DATASET
+mtcars_test <- testing(mtcars_split)
+
+set.seed(234)
+
+mtcars_folds <- vfold_cv(mtcars_train, strata = cluster)
+
+
+# FEATURE ENGINEERING -----------------------------------------------------
+
+mtcars_recipe <- recipe(cluster ~ ., data = mtcars_train) %>%
+  step_YeoJohnson(all_numeric_predictors()) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_zv(all_numeric_predictors()) %>%
+  step_normalize(all_numeric_predictors()) # %>%
+# step_smote(cluster)
+
+mtcars_recipe %>%
+  prep() %>%
+  bake(new_data = mtcars_train)
+
+
+# MODEL SPECIFICATION -----------------------------------------------------
+
+# DEFINE A MODEL SPECIFICATION
+tree_model <- decision_tree(
+  cost_complexity = tune(),
+  tree_depth = tune(),
+  min_n = tune()
+) %>%
+  set_engine("rpart") %>%
+  set_mode("classification")
+
+
+# DEFINE A WORKFLOW -------------------------------------------------------
+
+mtcars_workflow <- workflow() %>%
+  add_model(tree_model) %>%
+  add_recipe(mtcars_recipe)
+
+
+# HYPERPARAMETER TUNING ---------------------------------------------------
+
+mtcars_grid <- grid_regular(cost_complexity(),
+  tree_depth(),
+  min_n(),
+  levels = 4
+)
+
+# TUNING WITH A GRID
+
+doParallel::registerDoParallel()
+
+
+tree_tuning <- mtcars_workflow %>%
+  tune_grid(
+    resamples = mtcars_folds,
+    grid = mtcars_grid
+  )
+
+tree_tuning %>%
+  show_best("roc_auc")
+
+best_tree <- tree_tuning %>%
+  select_best(metric = "roc_auc")
+
+# FINALISE WORKFLOW
+
+final_tree_workflow <- mtcars_workflow %>%
+  finalize_workflow(best_tree)
+
+
+# VISUALISE RESULTS -------------------------------------------------------
+
+# FIT THE MODEL
+tree_wf_fit <- final_tree_workflow %>%
+  fit(data = mtcars_train)
+
+# EXTRACT THE TRAINED MODEL FROM THE WORKFLOW FIT
+tree_fit <- tree_wf_fit %>%
+  extract_fit_parsnip()
+
+# VISUALISE THE VARIABLE IMPORTANCE
+vip(tree_fit)
+
+# VISUALISE THE TRAINED MODEL USING RPART PLOT
+rpart.plot(tree_fit$fit, roundint = FALSE)
+
+
+# TRAIN AND EVALUATE ------------------------------------------------------
+
+tree_last_fit <- final_tree_workflow %>%
+  last_fit(mtcars_split)
+
+tree_last_fit %>% 
+  collect_metrics()
+
+tree_last_fit %>%
+  collect_predictions() %>%
+  conf_mat(cluster, .pred_class)
+
